@@ -1,5 +1,5 @@
 'use client';
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 
 const EMPRESA = {
   nome: "Salvador Law PA",
@@ -98,10 +98,223 @@ const parseCSV = (text) => {
   });
 };
 
+// ── ICS PARSER (Google Calendar) ─────────────────────────────
+const parseICS = (text) => {
+  const eventos = [];
+  const blocos = text.split("BEGIN:VEVENT");
+  blocos.slice(1).forEach(bloco => {
+    const get = (key) => {
+      const match = bloco.match(new RegExp(`${key}[^:]*:([^\r\n]+)`));
+      return match ? match[1].trim() : "";
+    };
+    const titulo = get("SUMMARY");
+    const inicio = get("DTSTART");
+    const fim = get("DTEND");
+    const descricao = get("DESCRIPTION");
+    const local = get("LOCATION");
+
+    if (!titulo) return;
+
+    // Parsear data
+    const parseDt = (dt) => {
+      if (!dt) return null;
+      const d = dt.replace(/[TZ]/g, "").replace(/[^0-9]/g, "");
+      if (d.length < 8) return null;
+      return new Date(
+        parseInt(d.slice(0,4)),
+        parseInt(d.slice(4,6))-1,
+        parseInt(d.slice(6,8)),
+        d.length > 8 ? parseInt(d.slice(8,10)) : 0,
+        d.length > 10 ? parseInt(d.slice(10,12)) : 0
+      );
+    };
+
+    const dataInicio = parseDt(inicio);
+    const dataFim = parseDt(fim);
+
+    eventos.push({
+      titulo,
+      dataInicio,
+      dataFim,
+      descricao: descricao.replace(/\n/g, " ").slice(0, 120),
+      local,
+      dataStr: dataInicio ? dataInicio.toLocaleDateString("pt-BR") : "",
+      horaStr: dataInicio ? dataInicio.toLocaleTimeString("pt-BR", {hour:"2-digit",minute:"2-digit"}) : "",
+    });
+  });
+
+  // Ordenar por data
+  eventos.sort((a, b) => (a.dataInicio || 0) - (b.dataInicio || 0));
+
+  // Filtrar próximos 30 dias
+  const hoje = new Date();
+  const em30 = new Date(); em30.setDate(hoje.getDate() + 30);
+  const proximos = eventos.filter(e => e.dataInicio && e.dataInicio >= hoje && e.dataInicio <= em30);
+  const passados = eventos.filter(e => e.dataInicio && e.dataInicio < hoje).slice(-5);
+
+  return { agenda: proximos, agendaPassada: passados, totalEventos: eventos.length };
+};
+
+// ── PARSER XLSX SALVADOR LAW ─────────────────────────────────
+// Lê o Excel de KPIs diretamente (SheetJS já converte para rows)
+const processarExcelSalvadorLaw = (rows) => {
+  // Detecta se é o Excel da Salvador Law pela primeira célula
+  const primeiraLinha = rows[0] ? Object.values(rows[0]).join(" ") : "";
+  if (!primeiraLinha.includes("SALVADOR LAW") && !primeiraLinha.includes("KPI")) return null;
+
+  const kpisAdv = [], kpisEq = [];
+  let leads = null, contratos = null;
+  const historico = [];
+
+  rows.forEach(row => {
+    const vals = Object.values(row).map(v => String(v || "").trim());
+    const kpi = vals[0];
+    const meta = vals[1] || vals[2] || "";
+    const resultado = vals[2] || vals[3] || "";
+    const status = vals[3] || vals[4] || "";
+
+    if (!kpi || kpi.startsWith("KPI") || kpi.startsWith("🔑 ") || kpi.startsWith("🔵 ") || kpi.startsWith("🟢 ") || kpi.startsWith("📋") || kpi.startsWith("✅") || kpi.startsWith("⚖️") || kpi.startsWith("⏱️") || kpi.startsWith("☀️") || kpi.startsWith("PAINEL") || kpi.startsWith("Estes") || kpi.startsWith("⚠️") || kpi.startsWith("──")) return;
+
+    // Leads
+    if (kpi.includes("Total de leads")) leads = { ...leads, total: parseInt(resultado) || 946 };
+    if (kpi.includes("convertidos em clientes")) leads = { ...leads, convertidos: parseInt(resultado) || 159 };
+    if (kpi.includes("Taxa de convers")) leads = { ...leads, taxa: parseFloat(String(resultado).replace("%","")) || 16.8 };
+    if (kpi.includes("Contacting")) leads = { ...leads, contacting: parseInt(resultado) || 18 };
+    if (kpi.includes("Open")) leads = { ...leads, open: parseInt(resultado) || 31 };
+
+    // KPIs da advogada (meta é %, responsável tem 🔑)
+    const resp = vals[1] || "";
+    if (resp.includes("Advogada") || resp.includes("🔑")) {
+      const val = resultado && !resultado.includes("Preencher") ? resultado : null;
+      const st = status.includes("🔴") ? "danger" : status.includes("🟢") ? "ok" : "verificar";
+      kpisAdv.push({ kpi, meta: meta.replace("🔑 Advogada","").trim()||meta, resultado: val, status: st });
+    }
+    // KPIs da equipe
+    else if (resp.includes("Paralegal") || resp.includes("equipe") || resp.includes("🔵") || resp.includes("Toda")) {
+      const val = resultado && !resultado.includes("Preencher") ? resultado : null;
+      const st = status.includes("🔴") ? "danger" : status.includes("🟢") ? "ok" : "verificar";
+      kpisEq.push({ kpi, meta: meta.replace("🔵 Paralegal","").replace("🔵 Toda equipe","").trim()||meta, resultado: val, status: st });
+    }
+
+    // Histórico mensal (formato: Jan/23, Fev/23...)
+    if (/^[A-Za-zÀ-ú]{3}\/\d{2}$/.test(kpi)) {
+      historico.push({
+        mes: kpi,
+        enviados: parseInt(meta) || 0,
+        assinados: parseInt(resultado) || 0,
+        expirados: parseInt(status) || 0,
+        taxa: parseFloat(String(vals[4]||"0").replace("%","")) || 0,
+        valor: parseFloat(String(vals[5]||"0").replace(/[^0-9.]/g,"")) || 0,
+      });
+    }
+  });
+
+  const resultado = {};
+  if (leads) resultado.leadsAtualizados = { ...{ total:946, convertidos:159, taxa:16.8, contacting:18, open:31, semStatus:738, meta:30 }, ...leads };
+  if (kpisAdv.length > 0) resultado.kpisAdvAtualizado = kpisAdv;
+  if (kpisEq.length > 0) resultado.kpisEqAtualizado = kpisEq;
+  if (historico.length > 0) resultado.historicoAtualizado = historico.slice(-6);
+  resultado._isSalvadorLaw = true;
+  return Object.keys(resultado).length > 1 ? resultado : null;
+};
+
+// ── PARSER LEADS (Docketwise) ────────────────────────────────
+// Colunas: full_name, lead_status, matters, email, ...
+const processarLeadsCSV = (rows) => {
+  let total=0, convertidos=0, contacting=0, open=0, semStatus=0;
+  rows.forEach(r => {
+    const status = (r['lead_status'] || r['status'] || '').trim();
+    const matters = (r['matters'] || '').trim();
+    total++;
+    if (status === 'Contacting') contacting++;
+    else if (status === 'Open') open++;
+    else if (!status || status === 'Unspecified') semStatus++;
+    // Convertido = tem matter associado
+    if (matters && matters !== 'Unspecified' && matters !== '') convertidos++;
+  });
+  const taxa = total > 0 ? parseFloat(((convertidos/total)*100).toFixed(1)) : 0;
+  return {
+    leadsAtualizados: { total, convertidos, taxa, contacting, open, semStatus, meta: 30 },
+    _isLeads: true,
+  };
+};
+
+// ── PARSER PANDADOC ───────────────────────────────────────────
+// Colunas: Document Name, Document Status, Total, Sent Date, Completed Date, Viewed Date...
+const processarPandaDoc = (rows) => {
+  let enviados=0, completados=0, expirados=0, declinados=0, draft=0;
+  let valorTotal=0, valorPendente=0;
+  const pendentes = [];
+  const mensal = {};
+
+  rows.forEach(r => {
+    const status = (r['Document Status'] || r['document status'] || '').trim();
+    const nome = (r['Document Name'] || r['document name'] || '').trim();
+    const total = parseFloat(r['Total'] || r['total'] || '0') || 0;
+    const criadoStr = (r['Created Date (UTC+0)'] || r['created date'] || '').slice(0,7);
+
+    enviados++;
+    valorTotal += total;
+
+    if (status === 'document.completed') { completados++; }
+    else if (status === 'document.expired') { expirados++; }
+    else if (status === 'document.declined') { declinados++; }
+    else if (status === 'document.draft') { draft++; }
+    else if (status === 'document.sent' || status === 'document.viewed') {
+      valorPendente += total;
+      const tipo = status === 'document.viewed' ? 'viu' : 'nao_viu';
+      const data = (r['Sent Date (UTC+0)'] || r['Created Date (UTC+0)'] || '').slice(0,10);
+      if (nome) pendentes.push({ doc: nome, valor: total, tipo, data });
+    }
+
+    // Histórico mensal
+    if (criadoStr && criadoStr.length === 7) {
+      const [ano, mes] = criadoStr.split('-');
+      const mesesPT = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+      const mesLabel = `${mesesPT[parseInt(mes)-1]}/${ano.slice(2)}`;
+      if (!mensal[mesLabel]) mensal[mesLabel] = { mes: mesLabel, enviados:0, assinados:0, expirados:0, valor:0, _ordem: parseInt(ano)*100+parseInt(mes) };
+      mensal[mesLabel].enviados++;
+      if (status === 'document.completed') { mensal[mesLabel].assinados++; mensal[mesLabel].valor += total; }
+      if (status === 'document.expired') mensal[mesLabel].expirados++;
+    }
+  });
+
+  // Ordenar e pegar últimos 6 meses
+  const historicoOrdenado = Object.values(mensal)
+    .sort((a,b) => a._ordem - b._ordem)
+    .map(h => ({ ...h, taxa: h.enviados > 0 ? parseFloat(((h.assinados/h.enviados)*100).toFixed(1)) : 0 }));
+  const historico6 = historicoOrdenado.slice(-6);
+
+  // Ordenar pendentes por valor desc
+  pendentes.sort((a,b) => b.valor - a.valor);
+
+  return {
+    historicoAtualizado: historico6,
+    contratosPendentesReal: pendentes,
+    contratosStats: {
+      totalHistorico: enviados,
+      pendentes: pendentes.length,
+      valorPendente,
+      naoVisualizaram: pendentes.filter(p=>p.tipo==='nao_viu').length,
+      visualizaramNaoAssinaram: pendentes.filter(p=>p.tipo==='viu').length,
+      completados, expirados, declinados, draft,
+    },
+    _isPandaDoc: true,
+  };
+};
+
 const processarRelatorio = (rows) => {
   if(!rows||rows.length===0)return null;
   const keys=Object.keys(rows[0]).map(k=>k.toLowerCase());
   const has=(k)=>keys.some(key=>key.includes(k));
+
+  // Leads do Docketwise
+  if(has("full_name")||has("lead_status")||(has("lead")&&has("status")))return processarLeadsCSV(rows);
+
+  // PandaDoc
+  if(has("document status")||has("document name")||(has("pandadoc")))return processarPandaDoc(rows);
+
+  // HouseCall Pro
   if(has("customer name")||(has("customer")&&has("paid amount")))return processarClientes(rows);
   if(has("employee"))return processarEquipe(rows);
   return null;
@@ -187,6 +400,30 @@ const Section = ({icon,title,count,badge,children})=>(
   </div>
 );
 
+// Carrega SheetJS dinamicamente para ler XLSX
+const loadSheetJS = () => new Promise((resolve, reject) => {
+  if (window.XLSX) { resolve(window.XLSX); return; }
+  const script = document.createElement('script');
+  script.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+  script.onload = () => resolve(window.XLSX);
+  script.onerror = reject;
+  document.head.appendChild(script);
+});
+
+const parseXLSX = async (file) => {
+  const XLSX = await loadSheetJS();
+  const buffer = await file.arrayBuffer();
+  const wb = XLSX.read(buffer, { type: 'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const json = XLSX.utils.sheet_to_json(ws, { defval: '' });
+  // Normaliza chaves para lowercase
+  return json.map(row => {
+    const obj = {};
+    Object.keys(row).forEach(k => { obj[k.toLowerCase().trim()] = String(row[k] || '').trim(); });
+    return obj;
+  });
+};
+
 const DropZone = ({onExtras,extras})=>{
   const [drag,setDrag]=useState(false);
   const [loading,setLoading]=useState(false);
@@ -207,8 +444,33 @@ const DropZone = ({onExtras,extras})=>{
             if(partial)newFiles.push({name:file.name,rows:rows.length,data:partial});
             else setError(`Formato não reconhecido: ${file.name}`);
           }
-        }else{newFiles.push({name:file.name,rows:"—",data:null,note:"Exporte como CSV"});}
-      }catch(e){setError(`Erro ao ler ${file.name}`);}
+        }else if(ext==="xlsx"||ext==="xls"){
+          const rows=await parseXLSX(file);
+          if(rows&&rows.length>0){
+            // Tenta parser específico do Excel da Salvador Law primeiro
+            const salvadorData=processarExcelSalvadorLaw(rows);
+            if(salvadorData){
+              newFiles.push({name:file.name,rows:rows.length,data:salvadorData,note:"✅ Excel KPIs detectado"});
+            } else {
+              const partial=processarRelatorio(rows);
+              if(partial)newFiles.push({name:file.name,rows:rows.length,data:partial});
+              else newFiles.push({name:file.name,rows:rows.length,data:null,note:"Excel lido — formato não mapeado"});
+            }
+          }
+        }else if(ext==="ics"){
+          const text=await file.text();
+          const agendaData=parseICS(text);
+          if(agendaData&&agendaData.totalEventos>0){
+            newFiles.push({name:file.name,rows:agendaData.totalEventos,data:{agenda:agendaData}});
+          }else{
+            newFiles.push({name:file.name,rows:"—",data:null,note:"Nenhum evento encontrado no .ics"});
+          }
+        }else if(ext==="pdf"){
+          newFiles.push({name:file.name,rows:"—",data:null,note:"PDF: exporte como ICS pelo Google Calendar"});
+        }else{
+          newFiles.push({name:file.name,rows:"—",data:null,note:`Formato .${ext} não suportado — use CSV ou XLSX`});
+        }
+      }catch(e){setError(`Erro ao ler ${file.name}: ${e.message}`);}
     }
     setFiles(prev=>[...prev,...newFiles]);
     const allPartials=[...files,...newFiles].filter(f=>f.data).map(f=>f.data);
@@ -218,6 +480,22 @@ const DropZone = ({onExtras,extras})=>{
         if(p.faturamento)novo.faturamentoSemana=p.faturamento;
         if(p.equipe)novo.equipe=p.equipe;
         if(p.clientesPendentes)novo.clientesPagPendentes=p.clientesPendentes;
+        if(p.agenda)novo.agenda=p.agenda;
+        // Dados do Excel de KPIs da Salvador Law
+        if(p._isSalvadorLaw){
+          if(p.leadsAtualizados)novo.leadsAtualizados=p.leadsAtualizados;
+          if(p.kpisAdvAtualizado)novo.kpisAdvAtualizado=p.kpisAdvAtualizado;
+          if(p.kpisEqAtualizado)novo.kpisEqAtualizado=p.kpisEqAtualizado;
+          if(p.historicoAtualizado)novo.historicoAtualizado=p.historicoAtualizado;
+        }
+        // Leads do Docketwise
+        if(p._isLeads&&p.leadsAtualizados)novo.leadsAtualizados=p.leadsAtualizados;
+        // PandaDoc
+        if(p._isPandaDoc){
+          if(p.historicoAtualizado)novo.historicoAtualizado=p.historicoAtualizado;
+          if(p.contratosPendentesReal)novo.contratosPendentesReal=p.contratosPendentesReal;
+          if(p.contratosStats)novo.contratosStats=p.contratosStats;
+        }
       });
       onExtras(novo);
     }
@@ -241,10 +519,10 @@ const DropZone = ({onExtras,extras})=>{
       <div style={{fontSize:12,color:"#4A6A8A",fontWeight:700,marginBottom:10}}>📥 Complementar com dados do HouseCall Pro (opcional):</div>
       <div onDrop={onDrop} onDragOver={(e)=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)} onClick={()=>fileRef.current?.click()}
         style={{border:`2px dashed ${drag?EMPRESA.accent:"#1A3050"}`,borderRadius:14,padding:"28px 20px",textAlign:"center",background:drag?EMPRESA.accent+"08":"#050F1A",cursor:"pointer",transition:"all .3s",marginBottom:14}}>
-        <input ref={fileRef} type="file" accept=".csv,.txt" multiple style={{display:"none"}} onChange={e=>handleFiles(e.target.files)}/>
+        <input ref={fileRef} type="file" accept=".csv,.txt,.xlsx,.xls,.ics,.pdf" multiple style={{display:"none"}} onChange={e=>handleFiles(e.target.files)}/>
         <div style={{fontSize:32,marginBottom:6}}>{loading?"⏳":"📂"}</div>
-        <div style={{fontSize:13,fontWeight:700,color:"#6A8AAA"}}>{loading?"Processando...":"Arraste CSV aqui"}</div>
-        <div style={{fontSize:11,color:"#3A5A7A",marginTop:4}}>Customer details · Tech leaderboard</div>
+        <div style={{fontSize:13,fontWeight:700,color:"#6A8AAA"}}>{loading?"Processando...":"Arraste CSV, XLSX ou .ics aqui"}</div>
+        <div style={{fontSize:11,color:"#3A5A7A",marginTop:4}}>CSV · Excel (.xlsx) · Google Calendar (.ics)</div>
       </div>
 
       {error&&<div style={{padding:"10px 14px",background:EMPRESA.danger+"12",border:`1px solid ${EMPRESA.danger}33`,borderRadius:10,fontSize:12,color:EMPRESA.danger,marginBottom:10}}>⚠️ {error}</div>}
@@ -265,8 +543,15 @@ const DropZone = ({onExtras,extras})=>{
 const VisaoDono = ({dados,extras})=>{
   const [aba,setAba]=useState("resumo");
   const d=dados;
-  const taxaConv=d.leads.taxa;
-  const ultimoMes=d.historico[d.historico.length-1];
+  // Usa dados atualizados se disponível
+  const leads = extras.leadsAtualizados || d.leads;
+  const kpisAdv = extras.kpisAdvAtualizado || d.kpisAdvogada;
+  const kpisEq = extras.kpisEqAtualizado || d.kpisEquipe;
+  const historico = extras.historicoAtualizado || d.historico;
+  const contratos = extras.contratosStats || d.contratos;
+  const contratosPendentes = extras.contratosPendentesReal || d.contratosPendentes;
+  const taxaConv=leads.taxa;
+  const ultimoMes=historico[historico.length-1];
   const fat=extras.faturamentoSemana;
 
   return(
@@ -291,11 +576,11 @@ const VisaoDono = ({dados,extras})=>{
       {aba==="resumo"&&(
         <>
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10}}>
-            <Metric icon="📄" label="Contratos Pendentes" value={`${d.contratos.pendentes}`} sub={`${fmt(d.contratos.valorPendente)} em aberto`} color={EMPRESA.warning} big/>
-            <Metric icon="🎯" label="Taxa Conversão" value={`${taxaConv}%`} sub={`Meta: ${d.leads.meta}% · ${d.leads.convertidos} convertidos`} color={taxaConv>=d.leads.meta?EMPRESA.success:EMPRESA.danger} big/>
-            <Metric icon="👥" label="Total de Leads" value={d.leads.total.toLocaleString()} sub={`${d.leads.contacting} contato · ${d.leads.open} abertos`} color={EMPRESA.accent2}/>
+            <Metric icon="📄" label="Contratos Pendentes" value={`${contratos.pendentes}`} sub={`${fmt(contratos.valorPendente)} em aberto`} color={EMPRESA.warning} big/>
+            <Metric icon="🎯" label="Taxa Conversão" value={`${taxaConv}%`} sub={`Meta: ${leads.meta}% · ${leads.convertidos} convertidos`} color={taxaConv>=leads.meta?EMPRESA.success:EMPRESA.danger} big/>
+            <Metric icon="👥" label="Total de Leads" value={leads.total.toLocaleString()} sub={`${leads.contacting} contato · ${leads.open} abertos`} color={EMPRESA.accent2}/>
             <Metric icon="📈" label={`Fechamento ${ultimoMes?.mes}`} value={`${ultimoMes?.taxa}%`} sub={`${ultimoMes?.assinados} assinados · ${fmt(ultimoMes?.valor||0)}`} color={ultimoMes?.taxa>=70?EMPRESA.success:EMPRESA.warning}/>
-            <Metric icon="💰" label="Histórico Total" value={`$${(d.historico.reduce((s,h)=>s+h.valor,0)/1000).toFixed(0)}k`} sub={`${d.contratos.totalHistorico} contratos · 39 meses`} color={EMPRESA.gold}/>
+            <Metric icon="💰" label="Histórico Total" value={`$${(historico.reduce((s,h)=>s+h.valor,0)/1000).toFixed(0)}k`} sub={`${contratos.totalHistorico} contratos · 39 meses`} color={EMPRESA.gold}/>
           </div>
 
           {fat&&(
@@ -312,8 +597,8 @@ const VisaoDono = ({dados,extras})=>{
             <Card style={{borderColor:EMPRESA.danger+"33",background:EMPRESA.danger+"06"}}>
               {[
                 {txt:<><strong>738 leads sem status</strong> — qualificar ou arquivar no DW urgente</>},
-                {txt:<><strong>Taxa de conversão {taxaConv}%</strong> — meta é {d.leads.meta}% · revisar qualificação e follow-up</>},
-                {txt:<><strong>21 contratos pendentes</strong> · {fmt(d.contratos.valorPendente)} em aberto — ver aba Contratos</>},
+                {txt:<><strong>Taxa de conversão {taxaConv}%</strong> — meta é {leads.meta}% · revisar qualificação e follow-up</>},
+                {txt:<><strong>21 contratos pendentes</strong> · {fmt(contratos.valorPendente)} em aberto — ver aba Contratos</>},
               ].map((item,i,arr)=>(
                 <div key={i} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 0",borderBottom:i<arr.length-1?"1px solid #1A3050":"none"}}>
                   <span style={{flexShrink:0}}>⚠️</span>
@@ -323,15 +608,34 @@ const VisaoDono = ({dados,extras})=>{
             </Card>
           </Section>
 
+          {extras.agenda&&extras.agenda.agenda&&extras.agenda.agenda.length>0&&(
+            <Section icon="📅" title="Próximos Eventos" count={extras.agenda.agenda.length}>
+              <Card>
+                {extras.agenda.agenda.slice(0,5).map((ev,i,arr)=>(
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"9px 0",borderBottom:i<arr.length-1?"1px solid #1A3050":"none"}}>
+                    <div style={{minWidth:44,textAlign:"center",flexShrink:0}}>
+                      <div style={{fontSize:16,fontWeight:900,color:EMPRESA.accent2}}>{ev.dataStr.split("/")[0]}</div>
+                      <div style={{fontSize:9,color:"#3A5A7A"}}>{["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][parseInt(ev.dataStr.split("/")[1])-1]}</div>
+                    </div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:13,color:"#E8F0F8",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ev.titulo}</div>
+                      {ev.horaStr!=="00:00"&&<div style={{fontSize:10,color:EMPRESA.gold}}>{ev.horaStr}{ev.local?" · "+ev.local:""}</div>}
+                    </div>
+                  </div>
+                ))}
+              </Card>
+            </Section>
+          )}
+
           <Section icon="📈" title="Evolução — Últimos 6 Meses">
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
               <Card>
                 <div style={{fontSize:10,color:"#3A5A7A",fontWeight:700,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>Valor Fechado</div>
-                <MiniBar data={d.historico.map(h=>({val:h.valor,label:h.mes}))} colorFn={()=>EMPRESA.accent}/>
+                <MiniBar data={historico.map(h=>({val:h.valor,label:h.mes}))} colorFn={()=>EMPRESA.accent}/>
               </Card>
               <Card>
                 <div style={{fontSize:10,color:"#3A5A7A",fontWeight:700,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>Taxa de Fechamento %</div>
-                <MiniBar data={d.historico.map(h=>({val:Math.round(h.taxa),label:h.mes}))} colorFn={d=>d.val>=75?EMPRESA.success:d.val>=60?EMPRESA.warning:EMPRESA.danger}/>
+                <MiniBar data={historico.map(h=>({val:Math.round(h.taxa),label:h.mes}))} colorFn={d=>d.val>=75?EMPRESA.success:d.val>=60?EMPRESA.warning:EMPRESA.danger}/>
               </Card>
             </div>
           </Section>
@@ -341,15 +645,15 @@ const VisaoDono = ({dados,extras})=>{
       {aba==="contratos"&&(
         <>
           <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
-            <Metric icon="📄" label="Pendentes" value={d.contratos.pendentes} sub={fmt(d.contratos.valorPendente)} color={EMPRESA.warning} big/>
-            <Metric icon="👁" label="Viram, não assinaram" value={d.contratos.visualizaramNaoAssinaram} sub="Ligar imediatamente" color={EMPRESA.danger}/>
-            <Metric icon="📤" label="Nem visualizaram" value={d.contratos.naoVisualizaram} sub="Reenviar e-mail" color={EMPRESA.warning}/>
+            <Metric icon="📄" label="Pendentes" value={contratos.pendentes} sub={fmt(contratos.valorPendente)} color={EMPRESA.warning} big/>
+            <Metric icon="👁" label="Viram, não assinaram" value={contratos.visualizaramNaoAssinaram} sub="Ligar imediatamente" color={EMPRESA.danger}/>
+            <Metric icon="📤" label="Nem visualizaram" value={contratos.naoVisualizaram} sub="Reenviar e-mail" color={EMPRESA.warning}/>
           </div>
 
-          <Section icon="⚠️" title="Contratos Pendentes — Ação Imediata" count={d.contratos.pendentes}>
+          <Section icon="⚠️" title="Contratos Pendentes — Ação Imediata" count={contratos.pendentes}>
             <Card>
-              {d.contratosPendentes.map((c,i)=>(
-                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:i<d.contratosPendentes.length-1?"1px solid #1A3050":"none",gap:10}}>
+              {contratosPendentes.map((c,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:i<contratosPendentes.length-1?"1px solid #1A3050":"none",gap:10}}>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontSize:12,color:"#D8E4F0",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.doc}</div>
                     <div style={{fontSize:10,color:"#3A5A7A",marginTop:2}}>{c.tipo==="nao_viu"?"📤 Não visualizou":"👁 Visualizou, não assinou"} · {c.data}</div>
@@ -365,8 +669,8 @@ const VisaoDono = ({dados,extras})=>{
 
           <Section icon="📈" title="Histórico — Últimos 6 Meses">
             <Card>
-              {d.historico.map((h,i)=>(
-                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:i<d.historico.length-1?"1px solid #1A3050":"none"}}>
+              {historico.map((h,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 0",borderBottom:i<historico.length-1?"1px solid #1A3050":"none"}}>
                   <span style={{fontSize:12,color:"#C8D8E8",fontWeight:700,width:55}}>{h.mes}</span>
                   <span style={{fontSize:11,color:"#4A6A8A"}}>{h.enviados} enviados</span>
                   <span style={{fontSize:11,color:EMPRESA.success}}>{h.assinados} assinados</span>
@@ -385,13 +689,13 @@ const VisaoDono = ({dados,extras})=>{
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:16}}>
               <div>
                 <div style={{fontSize:10,color:"#4A6A8A",fontWeight:700,textTransform:"uppercase",letterSpacing:1.5,marginBottom:6}}>🎯 Taxa de Conversão</div>
-                <div style={{fontSize:40,fontWeight:900,color:taxaConv>=d.leads.meta?EMPRESA.success:EMPRESA.danger,fontFamily:"'Georgia',serif"}}>{taxaConv}%</div>
-                <div style={{fontSize:12,color:"#4A6A8A",marginTop:4}}>Meta: {d.leads.meta}% · {taxaConv<d.leads.meta?`${(d.leads.meta-taxaConv).toFixed(1)}pp abaixo`:"✅ Meta atingida"}</div>
+                <div style={{fontSize:40,fontWeight:900,color:taxaConv>=leads.meta?EMPRESA.success:EMPRESA.danger,fontFamily:"'Georgia',serif"}}>{taxaConv}%</div>
+                <div style={{fontSize:12,color:"#4A6A8A",marginTop:4}}>Meta: {leads.meta}% · {taxaConv<leads.meta?`${(leads.meta-taxaConv).toFixed(1)}pp abaixo`:"✅ Meta atingida"}</div>
               </div>
-              <Ring value={Math.round(taxaConv)} size={80} color={taxaConv>=d.leads.meta?EMPRESA.success:EMPRESA.danger}/>
+              <Ring value={Math.round(taxaConv)} size={80} color={taxaConv>=leads.meta?EMPRESA.success:EMPRESA.danger}/>
             </div>
             <div style={{marginTop:16,display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,textAlign:"center"}}>
-              {[{l:"Total",v:d.leads.total,c:EMPRESA.accent2},{l:"Convertidos",v:d.leads.convertidos,c:EMPRESA.success},{l:"Em Contato",v:d.leads.contacting,c:EMPRESA.warning},{l:"Sem Status",v:d.leads.semStatus,c:EMPRESA.danger}].map((item,i)=>(
+              {[{l:"Total",v:leads.total,c:EMPRESA.accent2},{l:"Convertidos",v:leads.convertidos,c:EMPRESA.success},{l:"Em Contato",v:leads.contacting,c:EMPRESA.warning},{l:"Sem Status",v:leads.semStatus,c:EMPRESA.danger}].map((item,i)=>(
                 <div key={i} style={{padding:"10px 6px",background:"#0A1828",borderRadius:10,border:"1px solid #1A3050"}}>
                   <div style={{fontSize:20,fontWeight:900,color:item.c,fontFamily:"'Georgia',serif"}}>{item.v.toLocaleString()}</div>
                   <div style={{fontSize:9,color:"#4A6A8A",marginTop:4}}>{item.l}</div>
@@ -417,12 +721,55 @@ const VisaoDono = ({dados,extras})=>{
         </>
       )}
 
+      {aba==="agenda"&&(
+        <>
+          {extras.agenda&&extras.agenda.agenda&&extras.agenda.agenda.length>0?(
+            <>
+              <div style={{marginBottom:16,padding:"12px 16px",background:"#0A1828",borderRadius:12,border:"1px solid #1A3050"}}>
+                <div style={{fontSize:11,color:EMPRESA.gold,fontWeight:700}}>📅 {extras.agenda.agenda.length} evento(s) nos próximos 30 dias · {extras.agenda.totalEventos} total no calendário</div>
+              </div>
+              <Section icon="📅" title="Próximos Eventos" count={extras.agenda.agenda.length}>
+                <Card>
+                  {extras.agenda.agenda.map((ev,i)=>(
+                    <div key={i} style={{display:"flex",gap:14,padding:"12px 0",borderBottom:i<extras.agenda.agenda.length-1?"1px solid #1A3050":"none"}}>
+                      <div style={{minWidth:54,textAlign:"center",flexShrink:0}}>
+                        <div style={{fontSize:18,fontWeight:900,color:EMPRESA.accent2,fontFamily:"'Georgia',serif"}}>{ev.dataStr.split("/")[0]}</div>
+                        <div style={{fontSize:10,color:"#3A5A7A"}}>{["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][parseInt(ev.dataStr.split("/")[1])-1]}</div>
+                        {ev.horaStr!=="00:00"&&<div style={{fontSize:10,color:EMPRESA.gold,marginTop:2,fontWeight:700}}>{ev.horaStr}</div>}
+                      </div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:13,color:"#E8F0F8",fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ev.titulo}</div>
+                        {ev.local&&<div style={{fontSize:11,color:"#4A6A8A",marginTop:3}}>📍 {ev.local}</div>}
+                        {ev.descricao&&<div style={{fontSize:11,color:"#5A7A8A",marginTop:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ev.descricao}</div>}
+                      </div>
+                    </div>
+                  ))}
+                </Card>
+              </Section>
+            </>
+          ):(
+            <Card style={{textAlign:"center",padding:40}}>
+              <div style={{fontSize:40,marginBottom:12}}>📅</div>
+              <div style={{fontSize:15,fontWeight:800,color:"#6A8AAA",fontFamily:"'Georgia',serif",marginBottom:8}}>Agenda não carregada</div>
+              <div style={{fontSize:13,color:"#3A5A7A",marginBottom:20}}>Exporte o Google Calendar como .ics e faça upload em "Atualizar Dados"</div>
+              <div style={{fontSize:11,color:"#3A5A7A",background:"#0A1828",padding:"12px 16px",borderRadius:10,border:"1px solid #1A3050",textAlign:"left",lineHeight:2}}>
+                1. Abra <strong style={{color:EMPRESA.accent}}>calendar.google.com</strong><br/>
+                2. Clique em ⚙️ → <strong>Configurações</strong><br/>
+                3. Menu lateral → <strong>Importar e exportar</strong><br/>
+                4. Clique em <strong>Exportar</strong><br/>
+                5. Extraia o .zip e faça upload do .ics aqui
+              </div>
+            </Card>
+          )}
+        </>
+      )}
+
       {aba==="kpis"&&(
         <>
           <Section icon="🔑" title="KPIs da Advogada — Larissa" badge={<Badge text="Preencher semanalmente" color={EMPRESA.gold}/>}>
             <Card>
-              {d.kpisAdvogada.map((k,i)=>(
-                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:i<d.kpisAdvogada.length-1?"1px solid #1A3050":"none",gap:10}}>
+              {kpisAdv.map((k,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:i<kpisAdv.length-1?"1px solid #1A3050":"none",gap:10}}>
                   <div style={{flex:1}}>
                     <div style={{fontSize:12,color:"#C8D8E8"}}>{k.kpi}</div>
                     <div style={{fontSize:10,color:"#3A5A7A",marginTop:2}}>Meta: {k.meta}</div>
@@ -435,8 +782,8 @@ const VisaoDono = ({dados,extras})=>{
 
           <Section icon="🔵" title="KPIs da Equipe — Operacional" badge={<Badge text="Verificar diariamente" color={EMPRESA.accent}/>}>
             <Card>
-              {d.kpisEquipe.map((k,i)=>(
-                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:i<d.kpisEquipe.length-1?"1px solid #1A3050":"none",gap:10}}>
+              {kpisEq.map((k,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:i<kpisEq.length-1?"1px solid #1A3050":"none",gap:10}}>
                   <div style={{flex:1}}>
                     <div style={{fontSize:12,color:k.alerta?"#E8C8A8":"#C8D8E8"}}>{k.kpi}</div>
                     <div style={{fontSize:10,color:"#3A5A7A",marginTop:2}}>Meta: {k.meta}</div>
