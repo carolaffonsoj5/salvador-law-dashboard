@@ -75,25 +75,35 @@ const fmt = (v) => `$${(v||0).toLocaleString("en-US", { minimumFractionDigits: 2
 const fmtK = (v) => v >= 1000 ? `$${(v/1000).toFixed(0)}k` : fmt(v);
 const parseMoney = (s) => parseFloat((s||"0").replace(/[^0-9.]/g,""))||0;
 
-const parseCSVLine = (line) => {
-  const result=[]; let cur="", inQuote=false;
-  for(let i=0;i<line.length;i++){
-    const ch=line[i];
-    if(ch==='"'){if(inQuote&&line[i+1]==='"'){cur+='"';i++;}else{inQuote=!inQuote;}}
-    else if(ch===','&&!inQuote){result.push(cur.trim());cur="";}
-    else{cur+=ch;}
-  }
-  result.push(cur.trim());
-  return result;
-};
-
 const parseCSV = (text) => {
-  const lines=text.trim().replace(/\r\n/g,"\n").replace(/\r/g,"\n").split("\n");
-  if(lines.length<2)return null;
-  const headers=parseCSVLine(lines[0]).map(h=>h.toLowerCase().trim());
-  return lines.slice(1).filter(l=>l.trim()).map(line=>{
-    const vals=parseCSVLine(line); const obj={};
-    headers.forEach((h,i)=>{obj[h]=(vals[i]||"").trim();});
+  // Parser robusto que lida com campos multi-linha e vírgulas dentro de aspas
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  const rows = [];
+  let cur = "", inQuote = false, fields = [], i = 0;
+
+  while (i < normalized.length) {
+    const ch = normalized[i];
+    if (ch === '"') {
+      if (inQuote && normalized[i+1] === '"') { cur += '"'; i += 2; continue; }
+      inQuote = !inQuote; i++; continue;
+    }
+    if (ch === ',' && !inQuote) { fields.push(cur.trim()); cur = ""; i++; continue; }
+    if (ch === '\n' && !inQuote) {
+      fields.push(cur.trim()); cur = "";
+      if (fields.some(f => f)) rows.push(fields);
+      fields = []; i++; continue;
+    }
+    cur += ch; i++;
+  }
+  if (cur || fields.length) { fields.push(cur.trim()); if (fields.some(f => f)) rows.push(fields); }
+
+  if (rows.length < 2) return null;
+  const headers = rows[0].map(h => h.toLowerCase().replace(/[^a-z0-9_ ]/g, "").trim());
+  return rows.slice(1).map(vals => {
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = (vals[i] || "").trim(); });
+    // Também guarda chaves originais para compatibilidade
+    rows[0].forEach((hOrig, i) => { obj[hOrig] = (vals[i] || "").trim(); });
     return obj;
   });
 };
@@ -223,8 +233,16 @@ const processarExcelSalvadorLaw = (rows) => {
 const processarLeadsCSV = (rows) => {
   let total=0, convertidos=0, contacting=0, open=0, semStatus=0;
   rows.forEach(r => {
-    const status = (r['lead_status'] || r['status'] || '').trim();
-    const matters = (r['matters'] || '').trim();
+    const getVal = (...keys) => {
+      for (const k of keys) {
+        if (r[k] !== undefined) return r[k];
+        const found = Object.keys(r).find(rk => rk.toLowerCase() === k.toLowerCase());
+        if (found) return r[found];
+      }
+      return '';
+    };
+    const status = getVal('lead_status', 'status', 'Lead Status').trim();
+    const matters = getVal('matters', 'Matters', 'matter').trim();
     total++;
     if (status === 'Contacting') contacting++;
     else if (status === 'Open') open++;
@@ -248,10 +266,20 @@ const processarPandaDoc = (rows) => {
   const mensal = {};
 
   rows.forEach(r => {
-    const status = (r['Document Status'] || r['document status'] || '').trim();
-    const nome = (r['Document Name'] || r['document name'] || '').trim();
-    const total = parseFloat(r['Total'] || r['total'] || '0') || 0;
-    const criadoStr = (r['Created Date (UTC+0)'] || r['created date'] || '').slice(0,7);
+    // Busca flexível nas chaves (original e lowercase)
+    const getVal = (...keys) => {
+      for (const k of keys) {
+        if (r[k] !== undefined && r[k] !== '') return r[k];
+        // busca case-insensitive
+        const found = Object.keys(r).find(rk => rk.toLowerCase().includes(k.toLowerCase()));
+        if (found && r[found] !== '') return r[found];
+      }
+      return '';
+    };
+    const status = getVal('Document Status', 'document status', 'status').trim();
+    const nome = getVal('Document Name', 'document name', 'name').trim();
+    const total = parseFloat((getVal('Total', 'total') || '0').replace(/[^0-9.]/g,'')) || 0;
+    const criadoStr = getVal('Created Date (UTC+0)', 'created date', 'created').slice(0,7);
 
     enviados++;
     valorTotal += total;
@@ -309,10 +337,10 @@ const processarRelatorio = (rows) => {
   const has=(k)=>keys.some(key=>key.includes(k));
 
   // Leads do Docketwise
-  if(has("full_name")||has("lead_status")||(has("lead")&&has("status")))return processarLeadsCSV(rows);
+  if(has("full_name")||has("lead_status")||has("lead status")||(has("full")&&has("name")&&has("status")))return processarLeadsCSV(rows);
 
-  // PandaDoc
-  if(has("document status")||has("document name")||(has("pandadoc")))return processarPandaDoc(rows);
+  // PandaDoc — detecta por "document" + "status" ou "workspace"
+  if(has("document") && (has("status") || has("workspace") || has("template")))return processarPandaDoc(rows);
 
   // HouseCall Pro
   if(has("customer name")||(has("customer")&&has("paid amount")))return processarClientes(rows);
