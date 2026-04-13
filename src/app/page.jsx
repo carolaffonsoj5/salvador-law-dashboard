@@ -76,34 +76,44 @@ const fmtK = (v) => v >= 1000 ? `$${(v/1000).toFixed(0)}k` : fmt(v);
 const parseMoney = (s) => parseFloat((s||"0").replace(/[^0-9.]/g,""))||0;
 
 const parseCSV = (text) => {
-  // Parser robusto que lida com campos multi-linha e vírgulas dentro de aspas
-  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
-  const rows = [];
-  let cur = "", inQuote = false, fields = [], i = 0;
-
-  while (i < normalized.length) {
+  // Normaliza: remove quebras de linha DENTRO de campos com aspas
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  
+  // Pré-processa: junta linhas que estão dentro de aspas abertas
+  const cleanLines = [];
+  let buffer = "", inQuote = false;
+  for (let i = 0; i < normalized.length; i++) {
     const ch = normalized[i];
-    if (ch === '"') {
-      if (inQuote && normalized[i+1] === '"') { cur += '"'; i += 2; continue; }
-      inQuote = !inQuote; i++; continue;
-    }
-    if (ch === ',' && !inQuote) { fields.push(cur.trim()); cur = ""; i++; continue; }
-    if (ch === '\n' && !inQuote) {
-      fields.push(cur.trim()); cur = "";
-      if (fields.some(f => f)) rows.push(fields);
-      fields = []; i++; continue;
-    }
-    cur += ch; i++;
+    if (ch === '"') { inQuote = !inQuote; buffer += ch; }
+    else if (ch === '\n' && inQuote) { buffer += ' '; } // newline dentro de aspas → espaço
+    else if (ch === '\n' && !inQuote) { cleanLines.push(buffer); buffer = ""; }
+    else { buffer += ch; }
   }
-  if (cur || fields.length) { fields.push(cur.trim()); if (fields.some(f => f)) rows.push(fields); }
+  if (buffer) cleanLines.push(buffer);
 
-  if (rows.length < 2) return null;
-  const headers = rows[0].map(h => h.toLowerCase().replace(/[^a-z0-9_ ]/g, "").trim());
-  return rows.slice(1).map(vals => {
+  if (cleanLines.length < 2) return null;
+
+  const parseLine = (line) => {
+    const result = []; let cur = "", inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { if (inQ && line[i+1] === '"') { cur += '"'; i++; } else { inQ = !inQ; } }
+      else if (ch === ',' && !inQ) { result.push(cur.trim()); cur = ""; }
+      else { cur += ch; }
+    }
+    result.push(cur.trim());
+    return result;
+  };
+
+  const headers = parseLine(cleanLines[0]);
+  const headersLower = headers.map(h => h.toLowerCase().trim());
+
+  return cleanLines.slice(1).filter(l => l.trim()).map(line => {
+    const vals = parseLine(line);
     const obj = {};
+    // Guarda com chave original E lowercase
     headers.forEach((h, i) => { obj[h] = (vals[i] || "").trim(); });
-    // Também guarda chaves originais para compatibilidade
-    rows[0].forEach((hOrig, i) => { obj[hOrig] = (vals[i] || "").trim(); });
+    headersLower.forEach((h, i) => { obj[h] = (vals[i] || "").trim(); });
     return obj;
   });
 };
@@ -267,19 +277,11 @@ const processarPandaDoc = (rows) => {
 
   rows.forEach(r => {
     // Busca flexível nas chaves (original e lowercase)
-    const getVal = (...keys) => {
-      for (const k of keys) {
-        if (r[k] !== undefined && r[k] !== '') return r[k];
-        // busca case-insensitive
-        const found = Object.keys(r).find(rk => rk.toLowerCase().includes(k.toLowerCase()));
-        if (found && r[found] !== '') return r[found];
-      }
-      return '';
-    };
-    const status = getVal('Document Status', 'document status', 'status').trim();
-    const nome = getVal('Document Name', 'document name', 'name').trim();
-    const total = parseFloat((getVal('Total', 'total') || '0').replace(/[^0-9.]/g,'')) || 0;
-    const criadoStr = getVal('Created Date (UTC+0)', 'created date', 'created').slice(0,7);
+    const status = (r['Document Status'] || r['document status'] || '').trim();
+    const nome = (r['Document Name'] || r['document name'] || '').trim();
+    const total = parseFloat((r['Total'] || r['total'] || '0').replace(/[^0-9.]/g,'')) || 0;
+    const criadoStr = (r['Created Date (UTC+0)'] || r['created date (utc+0)'] || r['created date'] || '').slice(0,7);
+    const sentDate = (r['Sent Date (UTC+0)'] || r['sent date (utc+0)'] || r['sent date'] || '').slice(0,10);
 
     enviados++;
     valorTotal += total;
@@ -579,7 +581,7 @@ const VisaoDono = ({dados,extras})=>{
   const contratos = extras.contratosStats || d.contratos;
   const contratosPendentes = extras.contratosPendentesReal || d.contratosPendentes;
   const taxaConv=leads.taxa;
-  const ultimoMes=historico[historico.length-1];
+  const ultimoMes=historico&&historico.length>0?historico[historico.length-1]:null;
   const fat=extras.faturamentoSemana;
 
   return(
